@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -21,10 +22,10 @@ const (
 	defaultDPEServerAddress = "dpe:9009"
 
 	// system won't drain until a buffer is full
-	bufferLength = 500
+	bufferLength = 100
 
 	// system blocks while finding a buffer to drain blocks while finding a cache to drain blocks while finding a cache to drain blocks while finding a cache to drain and will consider all
-	maxCache = 2e6
+	maxCache = 2e5
 )
 
 func main() {
@@ -115,6 +116,7 @@ func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache][]*pmu_se
 			return fmt.Errorf("%v.Sample(_) = _, %v", pmuStream, err)
 		}
 
+		runtime.Gosched()
 		store(datum, cacheP, cacheMutex)
 	}
 }
@@ -216,6 +218,6 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 			}
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(40 * time.Millisecond)
 	}
 }
