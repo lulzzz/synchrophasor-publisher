@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"sync"
 	"time"
 
@@ -22,14 +23,25 @@ const (
 	defaultDPEServerAddress = "dpe:9009"
 
 	// system won't drain until a buffer is full
-	bufferLength = 100
+	bufferLength = 30
 
 	// system blocks while finding a buffer to drain blocks while finding a cache to drain blocks while finding a cache to drain blocks while finding a cache to drain and will consider all
-	maxCache = 2e5
+	maxCache = 2e6
 )
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 func main() {
 	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			panic(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	pmuServerAddress := os.Getenv("PMU_SERVER_ADDRESS")
 	if pmuServerAddress == "" {
@@ -41,12 +53,63 @@ func main() {
 		dpeServerAddress = defaultDPEServerAddress
 	}
 
-	// TODO: make a ring buffer of specific size
 	var cache [maxCache][]*pmu_server.SynchrophasorDatum
 	cacheMutex := &sync.Mutex{}
 
-	// TODO: maybe do a defer, panic, recover?
+	glog.Infof("Using cores: %v", runtime.GOMAXPROCS(-1))
 
+	for {
+		go connectAndRead(pmuServerAddress, &cache, cacheMutex)
+		go connectAndSend(dpeServerAddress, &cache, cacheMutex)
+
+		start := time.Now().Unix()
+
+		// TODO: add use of the grpc stats handler too
+		// start a stats and reporting loop
+		for {
+			// N.B. we don't synchronize this section so the queue stats are only approximate
+
+			fullBuffers := 0
+
+			for _, buf := range cache {
+				if len(buf) == bufferLength {
+					fullBuffers++
+				}
+			}
+
+			glog.Infof("RAM cache at %2.2f%% capacity: %v buffers full of %v\n", ((float64(fullBuffers) / float64(maxCache)) * 100), fullBuffers, maxCache)
+			time.Sleep(10 * time.Second)
+
+			// die at same time to get comparable stats
+			if (*cpuprofile != "") && time.Now().Unix()-start > 300 {
+				return
+			}
+		}
+	}
+}
+
+func connectAndSend(dpeServerAddress string, cache *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
+	for {
+		dpeClient, dpeConn, err := dpeConnect(dpeServerAddress)
+		if err != nil {
+			glog.Errorf("Error connecting to DPE server: %v", err)
+		}
+
+		if dpeClient != nil {
+			if err := send(dpeClient, cache, cacheMutex); err != nil {
+				glog.Errorf("Error sending data: %v", err)
+			}
+
+			glog.Infof("Attempting to close DPE client connection before trying to reconnect to the server")
+			dpeConn.Close()
+		}
+
+		// delay reconnection
+		time.Sleep(60 * time.Second)
+	}
+}
+
+func connectAndRead(pmuServerAddress string, cache *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
 	for {
 		glog.Infof("Connecting to %v", pmuServerAddress)
 		pmuClient, pmuConn, err := pmuConnect(pmuServerAddress)
@@ -54,33 +117,24 @@ func main() {
 			glog.Errorf("Error connecting to PMU server: %v", err)
 		}
 
-		dpeClient, dpeConn, err := dpeConnect(dpeServerAddress)
-		if err != nil {
-			glog.Errorf("Error connecting to DPE server: %v", err)
+		if pmuClient != nil {
+			// this call blocks until the stream ends; that's an error in our system
+			if err := read(pmuClient, cache, cacheMutex); err != nil {
+				glog.Errorf("Error reading from server: %v", err)
+			}
+
+			glog.Infof("Attempting to close PMU client connection before trying to reconnect to the server")
+			pmuConn.Close()
 		}
 
-		// start the forwarder
-		go send(dpeClient, &cache, cacheMutex)
-
-		// this call blocks until the stream ends; that's an error in our system
-		err = read(pmuClient, &cache, cacheMutex)
-		if err != nil {
-			glog.Errorf("Error reading from server: %v", err)
-		}
-
-		glog.Infof("Attempting to close PMU client connection before trying to reconnect to the server")
-		pmuConn.Close()
-
-		glog.Infof("Attempting to close DPE client connection before trying to reconnect to the server")
-		dpeConn.Close()
-
-		time.Sleep(30 * time.Second)
+		// delay reconnection
+		time.Sleep(10 * time.Second)
 	}
 }
 
 // TODO: consider using the gRPC backup connection lib here
 func pmuConnect(pmuServerAddress string) (pmu_server.SynchrophasorDataClient, *grpc.ClientConn, error) {
-	conn, err := grpc.Dial(pmuServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second))
+	conn, err := grpc.Dial(pmuServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -91,7 +145,7 @@ func pmuConnect(pmuServerAddress string) (pmu_server.SynchrophasorDataClient, *g
 
 // TODO: reduce duplication between this connection initiation and the previous
 func dpeConnect(dpeServerAddress string) (synchrophasor_dpe.SynchrophasorDPEClient, *grpc.ClientConn, error) {
-	conn, err := grpc.Dial(dpeServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second))
+	conn, err := grpc.Dial(dpeServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -116,13 +170,9 @@ func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache][]*pmu_se
 			return fmt.Errorf("%v.Sample(_) = _, %v", pmuStream, err)
 		}
 
-		runtime.Gosched()
 		store(datum, cacheP, cacheMutex)
+		runtime.Gosched()
 	}
-}
-
-func calcCacheLocation(cache [maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
-
 }
 
 func store(datum *pmu_server.SynchrophasorDatum, cacheP *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
@@ -148,7 +198,6 @@ func store(datum *pmu_server.SynchrophasorDatum, cacheP *[maxCache][]*pmu_server
 			cacheIdx = idx
 			break
 		}
-
 	}
 
 	if cacheIdx < 0 {
@@ -157,10 +206,9 @@ func store(datum *pmu_server.SynchrophasorDatum, cacheP *[maxCache][]*pmu_server
 		(*cacheP)[cacheIdx] = append((*cacheP)[cacheIdx], datum)
 		glog.V(6).Infof("Stored %v. Cache total: %v. Buffer total: %v", datum.GetId(), len(*cacheP), len((*cacheP)[cacheIdx]))
 	}
-
 }
 
-func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
+func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) error {
 
 	lat := os.Getenv("HZN_LAT")
 	lon := os.Getenv("HZN_LON")
@@ -177,7 +225,6 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 
 			b := (*cacheP)[idx]
 
-			// TODO: sloppy, redo this and eliminate duplication
 			if b != nil && len(b) == cap(b) {
 				// we've found one
 				glog.V(5).Infof("Found buffer at %v for sending", idx)
@@ -196,7 +243,7 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 
 			stream, err := client.Store(context.Background())
 			if err != nil {
-				glog.Fatalf("Error establishing stream to DPE server: %v", err)
+				return fmt.Errorf("Error establishing stream to DPE server: %v", err)
 			}
 
 			for _, datum := range *buffer {
@@ -209,15 +256,15 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 			}
 
 			if err != nil {
-				glog.Errorf("Error sending data to stream")
-			} else {
-				cacheMutex.Lock()
-				glog.V(5).Infof("Gonna drain buffer at %v with record count: %v", bufferIdx, len(*buffer))
-				(*cacheP)[bufferIdx] = nil
-				cacheMutex.Unlock()
+				return fmt.Errorf("Error sending data to stream: %v", err)
 			}
+
+			cacheMutex.Lock()
+			glog.V(5).Infof("Gonna drain buffer at %v with record count: %v", bufferIdx, len(*buffer))
+			(*cacheP)[bufferIdx] = nil
+			cacheMutex.Unlock()
 		}
 
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
