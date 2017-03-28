@@ -26,8 +26,37 @@ const (
 	bufferLength = 30
 
 	// system blocks while finding a buffer to drain blocks while finding a cache to drain blocks while finding a cache to drain blocks while finding a cache to drain and will consider all
-	maxCache = 2e6
+	maxCache = bufferLength * 10
 )
+
+type buffer struct {
+	writePtr int
+	data     [bufferLength]*pmu_server.SynchrophasorDatum
+}
+
+func newBuffer() *buffer {
+	return &buffer{
+		writePtr: 0,
+		data:     [bufferLength]*pmu_server.SynchrophasorDatum{},
+	}
+}
+
+// returns -1 if write not possible b/c buffer is full, otherwise returns index of written location
+func (b *buffer) write(datumP *pmu_server.SynchrophasorDatum) int {
+	if b.isFull() {
+		return -1
+	}
+
+	b.data[b.writePtr] = datumP
+	b.writePtr++
+	return b.writePtr
+}
+
+func (b *buffer) isFull() bool {
+	return b.writePtr == bufferLength
+}
+
+// TODO: add function to buffer to serialize to disk for further cache storage
 
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
@@ -53,7 +82,7 @@ func main() {
 		dpeServerAddress = defaultDPEServerAddress
 	}
 
-	var cache [maxCache][]*pmu_server.SynchrophasorDatum
+	cache := [maxCache]*buffer{}
 	cacheMutex := &sync.Mutex{}
 
 	glog.Infof("Using cores: %v", runtime.GOMAXPROCS(-1))
@@ -72,7 +101,7 @@ func main() {
 			fullBuffers := 0
 
 			for _, buf := range cache {
-				if len(buf) == bufferLength {
+				if buf != nil && buf.isFull() {
 					fullBuffers++
 				}
 			}
@@ -81,14 +110,14 @@ func main() {
 			time.Sleep(10 * time.Second)
 
 			// die at same time to get comparable stats
-			if (*cpuprofile != "") && time.Now().Unix()-start > 300 {
+			if (*cpuprofile != "") && time.Now().Unix()-start > 120 {
 				return
 			}
 		}
 	}
 }
 
-func connectAndSend(dpeServerAddress string, cache *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
+func connectAndSend(dpeServerAddress string, cache *[maxCache]*buffer, cacheMutex *sync.Mutex) {
 	for {
 		dpeClient, dpeConn, err := dpeConnect(dpeServerAddress)
 		if err != nil {
@@ -109,7 +138,7 @@ func connectAndSend(dpeServerAddress string, cache *[maxCache][]*pmu_server.Sync
 	}
 }
 
-func connectAndRead(pmuServerAddress string, cache *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
+func connectAndRead(pmuServerAddress string, cache *[maxCache]*buffer, cacheMutex *sync.Mutex) {
 	for {
 		glog.Infof("Connecting to %v", pmuServerAddress)
 		pmuClient, pmuConn, err := pmuConnect(pmuServerAddress)
@@ -154,7 +183,7 @@ func dpeConnect(dpeServerAddress string) (synchrophasor_dpe.SynchrophasorDPEClie
 	return client, conn, nil
 }
 
-func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) error {
+func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache]*buffer, cacheMutex *sync.Mutex) error {
 	pmuStream, err := client.Sample(context.Background(), &pmu_server.SamplingFilter{})
 	if err != nil {
 		glog.Fatalf("Error establishing stream from PMU server: %v", err)
@@ -175,40 +204,42 @@ func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache][]*pmu_se
 	}
 }
 
-func store(datum *pmu_server.SynchrophasorDatum, cacheP *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) {
+// find a buffer to write to
+func findFreeBuffer(cacheP *[maxCache]*buffer) (*buffer, error) {
+
+	for idx, cacheBuffer := range *cacheP {
+
+		if cacheBuffer == nil {
+			buff := newBuffer()
+			(*cacheP)[idx] = buff
+			glog.V(5).Infof("Found storage location [%v] in cache for new buffer", idx)
+			return buff, nil
+
+		} else if !cacheBuffer.isFull() {
+			return cacheBuffer, nil
+		}
+	}
+
+	return nil, fmt.Errorf("Cache is at capacity (%v buckets of %v elements each), dropping record!!", maxCache, bufferLength)
+}
+
+func store(datum *pmu_server.SynchrophasorDatum, cacheP *[maxCache]*buffer, cacheMutex *sync.Mutex) {
 
 	// TODO: optimize this, it's wasteful to re-determine the location with every call to store
 
 	// lock to determine write location
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
-	cacheIdx := -1
 
-	// find a spot for a buffer, create one and retain it
-	for idx, buf := range *cacheP {
-
-		if buf == nil {
-			buffer := make([]*pmu_server.SynchrophasorDatum, 0, bufferLength)
-			(*cacheP)[idx] = buffer
-			cacheIdx = idx
-			glog.V(5).Infof("Found storage location [%v] in cache for new buffer", cacheIdx)
-			break
-
-		} else if len(buf) < cap(buf) {
-			cacheIdx = idx
-			break
-		}
-	}
-
-	if cacheIdx < 0 {
-		glog.Errorf("Cache is at capacity (%v buckets of %v elements each), dropping record!!: %v", maxCache, bufferLength, datum.GetId())
+	buf, err := findFreeBuffer(cacheP)
+	if err != nil {
+		glog.Errorf("Error saving datum %v, err: %v", datum.GetId(), err)
 	} else {
-		(*cacheP)[cacheIdx] = append((*cacheP)[cacheIdx], datum)
-		glog.V(6).Infof("Stored %v. Cache total: %v. Buffer total: %v", datum.GetId(), len(*cacheP), len((*cacheP)[cacheIdx]))
+		buf.write(datum)
 	}
 }
 
-func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*pmu_server.SynchrophasorDatum, cacheMutex *sync.Mutex) error {
+func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache]*buffer, cacheMutex *sync.Mutex) error {
 
 	lat := os.Getenv("HZN_LAT")
 	lon := os.Getenv("HZN_LON")
@@ -217,25 +248,25 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 	for {
 		// TODO: if no buckets are full, sleep; if buckets are full, send all full buckets then clear them (synchronize the read, unlock, send, then synchronize the clear)
 
-		var buffer *[]*pmu_server.SynchrophasorDatum
-		var bufferIdx int
+		var buff *buffer
+		var buffIdx int
 
 		cacheMutex.Lock()
 		for idx := range *cacheP {
 
 			b := (*cacheP)[idx]
 
-			if b != nil && len(b) == cap(b) {
+			if b != nil && b.isFull() {
 				// we've found one
 				glog.V(5).Infof("Found buffer at %v for sending", idx)
-				buffer = &b
-				bufferIdx = idx
+				buff = b
+				buffIdx = idx
 				break
 			}
 		}
 		cacheMutex.Unlock()
 
-		if buffer == nil {
+		if buff == nil {
 			glog.V(6).Infof("No buffer found to forward to DPE")
 
 		} else {
@@ -246,7 +277,7 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 				return fmt.Errorf("Error establishing stream to DPE server: %v", err)
 			}
 
-			for _, datum := range *buffer {
+			for _, datum := range (*buff).data {
 				err = stream.Send(&synchrophasor_dpe.HorizonDatumWrapper{
 					Lat:         lat,
 					Lon:         lon,
@@ -260,11 +291,11 @@ func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache][]*
 			}
 
 			cacheMutex.Lock()
-			glog.V(5).Infof("Gonna drain buffer at %v with record count: %v", bufferIdx, len(*buffer))
-			(*cacheP)[bufferIdx] = nil
+			glog.V(5).Infof("Gonna drain buffer at %v with record count: %v", buffIdx, buff.writePtr)
+			(*cacheP)[buffIdx] = nil
 			cacheMutex.Unlock()
 		}
-
-		time.Sleep(500 * time.Millisecond)
+		runtime.Gosched()
 	}
+
 }
