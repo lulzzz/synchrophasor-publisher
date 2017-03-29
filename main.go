@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"runtime/pprof"
-	"sync"
+	"strconv"
+	"strings"
 	"time"
+
+	"runtime"
 
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
@@ -20,14 +22,32 @@ import (
 
 const (
 	defaultPMUServerAddress = "pmu:8008"
+
 	defaultDPEServerAddress = "dpe:9009"
 
-	// system won't drain until a buffer is full
-	bufferLength = 30
+	dpeReconnectionDelayS = 20
 
-	// system blocks while finding a buffer to drain blocks while finding a cache to drain blocks while finding a cache to drain blocks while finding a cache to drain and will consider all
-	maxCache = bufferLength * 10
+	// number of separate publishing threads / maintained connections with destination service
+	numPublishers = 10
+
+	// buffers are managed by publishers and (if failure occurs) written to disk
+	bufferLength = 1000
+
+	// When max buffers is reached, the system will *drop* new samples; it's expected that if the machine this is on is sufficiently spec'd, and the volume of input data is not overwhelming, this system will publish samples to a configured service or write the samples to disk before dropping is necessary.
+	//maxBuffers = bufferLength * 10
+
+	inputBufferMax = 2e6
+
+	// after this threshhold, failed message sends will get dropped (as whole buffers) before they are written to disk; writing to disk is a single-worker, bound task on purpose
+	failSendMaxBuffers = 2e6
+
+	// max channel size for already-cached failed sends; OK for these to get dropped, the source will re-read them from disk periodically and retry them
+	retrySendMaxBuffers = 2e2
+
+	operationSampleMax = 2e4
 )
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 type buffer struct {
 	writePtr int
@@ -56,9 +76,37 @@ func (b *buffer) isFull() bool {
 	return b.writePtr == bufferLength
 }
 
-// TODO: add function to buffer to serialize to disk for further cache storage
+func (b *buffer) isEmpty() bool {
+	return b.writePtr == 0
+}
 
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+func (b *buffer) remove(idx int) {
+	b.data[idx] = nil
+	b.writePtr--
+}
+
+type failMeta struct {
+	err   error
+	errTs uint64
+	// errDataIndices []int64 // the indices in the sparse data slice to which this error info applies
+	// errDataIDs []int64 // the datum IDs in the sparse data slice to which this error info applies
+}
+
+type dataSendFailure struct {
+	// sparse slice of failed send data
+	buffer   *buffer
+	failMeta []*failMeta
+	retries  int
+}
+
+type failCache struct {
+	failed           dataSendFailure
+	cachedBufferPath string
+}
+
+type operationSample struct {
+	successfulSentBuffers int
+}
 
 func main() {
 	flag.Parse()
@@ -82,108 +130,47 @@ func main() {
 		dpeServerAddress = defaultDPEServerAddress
 	}
 
-	cache := [maxCache]*buffer{}
-	cacheMutex := &sync.Mutex{}
+	// a non-blocking, async publish channel; input read from gRPC is written directly to it
+	publishChan := make(chan *pmu_server.SynchrophasorDatum, inputBufferMax)
 
-	glog.Infof("Using cores: %v", runtime.GOMAXPROCS(-1))
+	// a non-blocking, async single channel for publishers to write failed sends to or succeeded retries to; failed sends might be retried again or written to disk if they haven't already been written
+	publishFailedChan := make(chan *failCache, failSendMaxBuffers)
 
-	for {
-		go connectAndRead(pmuServerAddress, &cache, cacheMutex)
-		go connectAndSend(dpeServerAddress, &cache, cacheMutex)
+	// a non-blocking, async publish channel; output read by multiple publishers, input from single cacheManager
+	cachedAndRetryChan := make(chan *failCache, retrySendMaxBuffers)
 
-		start := time.Now().Unix()
+	operationSampleChan := make(chan *operationSample, operationSampleMax)
 
-		// TODO: add use of the grpc stats handler too
-		// start a stats and reporting loop
-		for {
-			// N.B. we don't synchronize this section so the queue stats are only approximate
+	// reads from publishChan and cachedAndRetryChan (preferring first) and writes to failedSend
+	startPublishers(dpeServerAddress, publishChan, cachedAndRetryChan, publishFailedChan, operationSampleChan)
 
-			fullBuffers := 0
+	// reads from publishFailedChan (failed sends *and* previously failed, but now successful sends) and writes to cachedAndRetryChan
+	go cacheManager(publishFailedChan, cachedAndRetryChan)
 
-			for _, buf := range cache {
-				if buf != nil && buf.isFull() {
-					fullBuffers++
-				}
-			}
+	// reads from initial input source and writes data to publishers
+	go subscriber(pmuServerAddress, publishChan)
 
-			glog.Infof("RAM cache at %2.2f%% capacity: %v buffers full of %v\n", ((float64(fullBuffers) / float64(maxCache)) * 100), fullBuffers, maxCache)
-			time.Sleep(10 * time.Second)
+	// reads from publishFailed, cachedAndRetry, and operationSample chans to form stats picture, then try publishing
 
-			// die at same time to get comparable stats
-			if (*cpuprofile != "") && time.Now().Unix()-start > 120 {
-				return
-			}
-		}
-	}
+	reportStats(publishFailedChan, cachedAndRetryChan, operationSampleChan)
+
+	//plan:
+	// create two channels: outbound to publishers, one inbound for failed sends
+	// start publisher pool (reads from publisher channel, writes to failed)
+	// start single fs writer (reads from failed, writes to disk)
+	// start single fs reader (writes to publisher channel, scans disk and reads from it)
+
 }
 
-func connectAndSend(dpeServerAddress string, cache *[maxCache]*buffer, cacheMutex *sync.Mutex) {
+func reportStats(publishFailedChan <-chan *failCache, cachedAndRetryChan <-chan *failCache, operationSampleChan <-chan *operationSample) {
 	for {
-		dpeClient, dpeConn, err := dpeConnect(dpeServerAddress)
-		if err != nil {
-			glog.Errorf("Error connecting to DPE server: %v", err)
-		}
+		glog.Infof("Gonna report some mean stats...")
 
-		if dpeClient != nil {
-			if err := send(dpeClient, cache, cacheMutex); err != nil {
-				glog.Errorf("Error sending data: %v", err)
-			}
-
-			glog.Infof("Attempting to close DPE client connection before trying to reconnect to the server")
-			dpeConn.Close()
-		}
-
-		// delay reconnection
-		time.Sleep(60 * time.Second)
-	}
-}
-
-func connectAndRead(pmuServerAddress string, cache *[maxCache]*buffer, cacheMutex *sync.Mutex) {
-	for {
-		glog.Infof("Connecting to %v", pmuServerAddress)
-		pmuClient, pmuConn, err := pmuConnect(pmuServerAddress)
-		if err != nil {
-			glog.Errorf("Error connecting to PMU server: %v", err)
-		}
-
-		if pmuClient != nil {
-			// this call blocks until the stream ends; that's an error in our system
-			if err := read(pmuClient, cache, cacheMutex); err != nil {
-				glog.Errorf("Error reading from server: %v", err)
-			}
-
-			glog.Infof("Attempting to close PMU client connection before trying to reconnect to the server")
-			pmuConn.Close()
-		}
-
-		// delay reconnection
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// TODO: consider using the gRPC backup connection lib here
-func pmuConnect(pmuServerAddress string) (pmu_server.SynchrophasorDataClient, *grpc.ClientConn, error) {
-	conn, err := grpc.Dial(pmuServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
-	if err != nil {
-		return nil, nil, err
-	}
-
-	client := pmu_server.NewSynchrophasorDataClient(conn)
-	return client, conn, nil
-}
-
-// TODO: reduce duplication between this connection initiation and the previous
-func dpeConnect(dpeServerAddress string) (synchrophasor_dpe.SynchrophasorDPEClient, *grpc.ClientConn, error) {
-	conn, err := grpc.Dial(dpeServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
-	if err != nil {
-		return nil, nil, err
-	}
-
-	client := synchrophasor_dpe.NewSynchrophasorDPEClient(conn)
-	return client, conn, nil
-}
-
-func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache]*buffer, cacheMutex *sync.Mutex) error {
+func read(client pmu_server.SynchrophasorDataClient, publishChan chan<- *pmu_server.SynchrophasorDatum) error {
 	pmuStream, err := client.Sample(context.Background(), &pmu_server.SamplingFilter{})
 	if err != nil {
 		glog.Fatalf("Error establishing stream from PMU server: %v", err)
@@ -199,103 +186,168 @@ func read(client pmu_server.SynchrophasorDataClient, cacheP *[maxCache]*buffer, 
 			return fmt.Errorf("%v.Sample(_) = _, %v", pmuStream, err)
 		}
 
-		store(datum, cacheP, cacheMutex)
+		publishChan <- datum
 		runtime.Gosched()
 	}
 }
 
-// find a buffer to write to
-func findFreeBuffer(cacheP *[maxCache]*buffer) (*buffer, error) {
-
-	for idx, cacheBuffer := range *cacheP {
-
-		if cacheBuffer == nil {
-			buff := newBuffer()
-			(*cacheP)[idx] = buff
-			glog.V(5).Infof("Found storage location [%v] in cache for new buffer", idx)
-			return buff, nil
-
-		} else if !cacheBuffer.isFull() {
-			return cacheBuffer, nil
-		}
-	}
-
-	return nil, fmt.Errorf("Cache is at capacity (%v buckets of %v elements each), dropping record!!", maxCache, bufferLength)
-}
-
-func store(datum *pmu_server.SynchrophasorDatum, cacheP *[maxCache]*buffer, cacheMutex *sync.Mutex) {
-
-	// TODO: optimize this, it's wasteful to re-determine the location with every call to store
-
-	// lock to determine write location
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
-
-	buf, err := findFreeBuffer(cacheP)
+func pmuConnect(pmuServerAddress string) (pmu_server.SynchrophasorDataClient, *grpc.ClientConn, error) {
+	conn, err := grpc.Dial(pmuServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
 	if err != nil {
-		glog.Errorf("Error saving datum %v, err: %v", datum.GetId(), err)
-	} else {
-		buf.write(datum)
+		return nil, nil, err
+	}
+
+	client := pmu_server.NewSynchrophasorDataClient(conn)
+	return client, conn, nil
+}
+
+func subscriber(pmuServerAddress string, publishChan chan<- *pmu_server.SynchrophasorDatum) {
+	for {
+		glog.Infof("Connecting to %v", pmuServerAddress)
+		pmuClient, pmuConn, err := pmuConnect(pmuServerAddress)
+		if err != nil {
+			glog.Errorf("Error connecting to PMU server: %v", err)
+		}
+
+		if pmuClient != nil {
+			// this call blocks until the stream ends; that's an error in our system
+			if err := read(pmuClient, publishChan); err != nil {
+				glog.Errorf("Error reading from server: %v", err)
+			}
+
+			glog.Infof("Attempting to close PMU client connection before trying to reconnect to the server")
+			pmuConn.Close()
+		}
+
+		// delay reconnection
+		time.Sleep(10 * time.Second)
 	}
 }
 
-func send(client synchrophasor_dpe.SynchrophasorDPEClient, cacheP *[maxCache]*buffer, cacheMutex *sync.Mutex) error {
+func cacheManager(publishFailedChan <-chan *failCache, cachedAndRetryChan chan<- *failCache) {
+
+	// for now, just copy if still failed
+	for {
+		select {
+		case failCache := <-publishFailedChan:
+			if !failCache.failed.buffer.isEmpty() {
+				(*failCache).failed.retries++
+				cachedAndRetryChan <- failCache
+			}
+		}
+
+		runtime.Gosched()
+	}
+}
+
+func startPublishers(dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *failCache, publishFailedChan chan<- *failCache, operationSampleChan chan<- *operationSample) {
+
+	// use 1 so publisher id output doesn't look as funny
+	for ix := 1; ix <= numPublishers; ix++ {
+		go connectAndPublish(ix, dpeServerAddress, publishChan, cachedAndRetryChan, publishFailedChan, operationSampleChan)
+	}
+}
+
+func dpeConnect(dpeServerAddress string) (synchrophasor_dpe.SynchrophasorDPEClient, *grpc.ClientConn, error) {
+	conn, err := grpc.Dial(dpeServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	client := synchrophasor_dpe.NewSynchrophasorDPEClient(conn)
+	return client, conn, nil
+}
+
+func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *failCache, publishFailedChan chan<- *failCache, operationSampleChan chan<- *operationSample) {
+	glog.Infof("Started publisher %v", id)
 
 	lat := os.Getenv("HZN_LAT")
 	lon := os.Getenv("HZN_LON")
 	agreementID := os.Getenv("HZN_AGREEMENTID")
+	deviceID := os.Getenv("DEVICE_ID")
+	haPartners := strings.Split(os.Getenv("HZN_HA_PARTNERS"), ",")
 
-	for {
-		// TODO: if no buckets are full, sleep; if buckets are full, send all full buckets then clear them (synchronize the read, unlock, send, then synchronize the clear)
+	// do conversions
+	latF, _ := strconv.ParseFloat(lat, 32)
+	lonF, _ := strconv.ParseFloat(lon, 32)
 
-		var buff *buffer
-		var buffIdx int
+	send := func(datum *pmu_server.SynchrophasorDatum, stream synchrophasor_dpe.SynchrophasorDPE_StoreClient) error {
 
-		cacheMutex.Lock()
-		for idx := range *cacheP {
+		glog.V(6).Infof("Publishing datum: %v", datum)
 
-			b := (*cacheP)[idx]
-
-			if b != nil && b.isFull() {
-				// we've found one
-				glog.V(5).Infof("Found buffer at %v for sending", idx)
-				buff = b
-				buffIdx = idx
-				break
-			}
-		}
-		cacheMutex.Unlock()
-
-		if buff == nil {
-			glog.V(6).Infof("No buffer found to forward to DPE")
-
-		} else {
-			glog.V(5).Infof("Found buffer to forward, sending to DPE")
-
-			stream, err := client.Store(context.Background())
-			if err != nil {
-				return fmt.Errorf("Error establishing stream to DPE server: %v", err)
-			}
-
-			for _, datum := range (*buff).data {
-				err = stream.Send(&synchrophasor_dpe.HorizonDatumWrapper{
-					Lat:         lat,
-					Lon:         lon,
-					AgreementID: agreementID,
-					Datum:       datum,
-				})
-			}
-
-			if err != nil {
+		if stream != nil {
+			if err := stream.Send(&synchrophasor_dpe.HorizonDatumWrapper{
+				Type:        "synchrophasor",
+				Lat:         float32(latF),
+				Lon:         float32(lonF),
+				DeviceID:    deviceID,
+				AgreementID: agreementID,
+				Datum:       datum,
+				HAPartners:  haPartners,
+			}); err != nil {
 				return fmt.Errorf("Error sending data to stream: %v", err)
 			}
-
-			cacheMutex.Lock()
-			glog.V(5).Infof("Gonna drain buffer at %v with record count: %v", buffIdx, buff.writePtr)
-			(*cacheP)[buffIdx] = nil
-			cacheMutex.Unlock()
 		}
-		runtime.Gosched()
+
+		return nil
 	}
 
+	var dpeClient synchrophasor_dpe.SynchrophasorDPEClient
+	var dpeConn *grpc.ClientConn
+	var stream synchrophasor_dpe.SynchrophasorDPE_StoreClient
+
+	pubError := func(unsentDatum *pmu_server.SynchrophasorDatum) {
+		// TODO: handle requeue; that involves buffering failures up then publishing to the channel; could be simpler if necessary
+		glog.Errorf("Failed to send datum: %v", unsentDatum)
+
+		//TODO: replace this with the gRPC backoff handling
+		// delay this publisher's reconnection reconnection
+		time.Sleep(dpeReconnectionDelayS * time.Second)
+
+		// trying to clean up
+		stream = nil
+		if dpeConn != nil {
+			dpeConn.Close()
+		}
+		dpeClient = nil
+	}
+
+	for {
+		select {
+		case datum := <-publishChan:
+
+			if stream == nil {
+				// set up the stream
+
+				if dpeClient == nil {
+					if cl, co, err := dpeConnect(dpeServerAddress); err != nil {
+						glog.Errorf("Error connecting to DPE server: %v", err)
+						pubError(datum)
+						continue
+
+					} else {
+						dpeClient = cl
+						dpeConn = co
+					}
+				}
+
+				st, err := dpeClient.Store(context.Background())
+				if err != nil {
+					glog.Errorf("Error calling Store on DPE server RPC: %v", err)
+					pubError(datum)
+
+				} else {
+					stream = st
+				}
+			}
+
+			if err := send(datum, stream); err != nil {
+				// TODO: handle requeue
+				pubError(datum)
+			}
+		}
+
+		// forevar !
+		runtime.Gosched()
+	}
 }
