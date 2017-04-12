@@ -28,10 +28,10 @@ const (
 	dpeReconnectionDelayS = 20
 
 	// number of separate publishing threads / maintained connections with destination service
-	numPublishers = 10
+	numPublishers = 30
 
 	// buffers are managed by publishers and (if failure occurs) written to disk
-	bufferLength = 1000
+	bufferLength = 50
 
 	// When max buffers is reached, the system will *drop* new samples; it's expected that if the machine this is on is sufficiently spec'd, and the volume of input data is not overwhelming, this system will publish samples to a configured service or write the samples to disk before dropping is necessary.
 	//maxBuffers = bufferLength * 10
@@ -80,11 +80,6 @@ func (b *buffer) isEmpty() bool {
 	return b.writePtr == 0
 }
 
-func (b *buffer) remove(idx int) {
-	b.data[idx] = nil
-	b.writePtr--
-}
-
 type failMeta struct {
 	err   error
 	errTs uint64
@@ -96,11 +91,10 @@ type dataSendFailure struct {
 	// sparse slice of failed send data
 	buffer   *buffer
 	failMeta []*failMeta
-	retries  int
 }
 
 type failCache struct {
-	failed           dataSendFailure
+	failed           *dataSendFailure
 	cachedBufferPath string
 }
 
@@ -134,25 +128,23 @@ func main() {
 	publishChan := make(chan *pmu_server.SynchrophasorDatum, inputBufferMax)
 
 	// a non-blocking, async single channel for publishers to write failed sends to or succeeded retries to; failed sends might be retried again or written to disk if they haven't already been written
-	publishFailedChan := make(chan *failCache, failSendMaxBuffers)
+	publishFailedChan := make(chan *pmu_server.SynchrophasorDatum, failSendMaxBuffers)
 
 	// a non-blocking, async publish channel; output read by multiple publishers, input from single cacheManager
-	cachedAndRetryChan := make(chan *failCache, retrySendMaxBuffers)
+	cachedAndRetryChan := make(chan *pmu_server.SynchrophasorDatum, retrySendMaxBuffers)
 
 	operationSampleChan := make(chan *operationSample, operationSampleMax)
 
 	// reads from publishChan and cachedAndRetryChan (preferring first) and writes to failedSend
 	startPublishers(dpeServerAddress, publishChan, cachedAndRetryChan, publishFailedChan, operationSampleChan)
 
-	// reads from publishFailedChan (failed sends *and* previously failed, but now successful sends) and writes to cachedAndRetryChan
-	go cacheManager(publishFailedChan, cachedAndRetryChan)
-
 	// reads from initial input source and writes data to publishers
 	go subscriber(pmuServerAddress, publishChan)
 
 	// reads from publishFailed, cachedAndRetry, and operationSample chans to form stats picture, then try publishing
 
-	reportStats(publishFailedChan, cachedAndRetryChan, operationSampleChan)
+	// reads from publishFailedChan (failed sends *and* previously failed, but now successful sends) and writes to cachedAndRetryChan
+	cacheManager(publishFailedChan, cachedAndRetryChan, operationSampleChan)
 
 	//plan:
 	// create two channels: outbound to publishers, one inbound for failed sends
@@ -162,11 +154,19 @@ func main() {
 
 }
 
-func reportStats(publishFailedChan <-chan *failCache, cachedAndRetryChan <-chan *failCache, operationSampleChan <-chan *operationSample) {
+func cacheManager(publishFailedChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan chan<- *pmu_server.SynchrophasorDatum, operationSampleChan <-chan *operationSample) {
+	// for now, just copy if still failed
 	for {
-		glog.Infof("Gonna report some mean stats...")
+		select {
+		case failedDatum := <-publishFailedChan:
+			glog.Info("Found previously-failed record, adding to cache for later retry")
+			cachedAndRetryChan <- failedDatum
 
-		time.Sleep(10 * time.Second)
+		default:
+			// nothing to process
+		}
+
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -186,6 +186,7 @@ func read(client pmu_server.SynchrophasorDataClient, publishChan chan<- *pmu_ser
 			return fmt.Errorf("%v.Sample(_) = _, %v", pmuStream, err)
 		}
 
+		glog.V(6).Infof("Read datum with ts: %v", datum.Ts)
 		publishChan <- datum
 		runtime.Gosched()
 	}
@@ -224,25 +225,9 @@ func subscriber(pmuServerAddress string, publishChan chan<- *pmu_server.Synchrop
 	}
 }
 
-func cacheManager(publishFailedChan <-chan *failCache, cachedAndRetryChan chan<- *failCache) {
+func startPublishers(dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *pmu_server.SynchrophasorDatum, publishFailedChan chan<- *pmu_server.SynchrophasorDatum, operationSampleChan chan<- *operationSample) {
 
-	// for now, just copy if still failed
-	for {
-		select {
-		case failCache := <-publishFailedChan:
-			if !failCache.failed.buffer.isEmpty() {
-				(*failCache).failed.retries++
-				cachedAndRetryChan <- failCache
-			}
-		}
-
-		runtime.Gosched()
-	}
-}
-
-func startPublishers(dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *failCache, publishFailedChan chan<- *failCache, operationSampleChan chan<- *operationSample) {
-
-	// use 1 so publisher id output doesn't look as funny
+	// count from 1 so publisher id output doesn't look as funny
 	for ix := 1; ix <= numPublishers; ix++ {
 		go connectAndPublish(ix, dpeServerAddress, publishChan, cachedAndRetryChan, publishFailedChan, operationSampleChan)
 	}
@@ -258,7 +243,7 @@ func dpeConnect(dpeServerAddress string) (synchrophasor_dpe.SynchrophasorDPEClie
 	return client, conn, nil
 }
 
-func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *failCache, publishFailedChan chan<- *failCache, operationSampleChan chan<- *operationSample) {
+func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *pmu_server.SynchrophasorDatum, publishFailedChan chan<- *pmu_server.SynchrophasorDatum, operationSampleChan chan<- *operationSample) {
 	glog.Infof("Started publisher %v", id)
 
 	lat := os.Getenv("HZN_LAT")
@@ -272,8 +257,6 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 	lonF, _ := strconv.ParseFloat(lon, 32)
 
 	send := func(datum *pmu_server.SynchrophasorDatum, stream synchrophasor_dpe.SynchrophasorDPE_StoreClient) error {
-
-		glog.V(6).Infof("Publishing datum: %v", datum)
 
 		if stream != nil {
 			if err := stream.Send(&synchrophasor_dpe.HorizonDatumWrapper{
@@ -297,12 +280,9 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 	var stream synchrophasor_dpe.SynchrophasorDPE_StoreClient
 
 	pubError := func(unsentDatum *pmu_server.SynchrophasorDatum) {
-		// TODO: handle requeue; that involves buffering failures up then publishing to the channel; could be simpler if necessary
-		glog.Errorf("Failed to send datum: %v", unsentDatum)
 
-		//TODO: replace this with the gRPC backoff handling
-		// delay this publisher's reconnection reconnection
-		time.Sleep(dpeReconnectionDelayS * time.Second)
+		glog.Errorf("Failed to send datum, cached for retry. Datum: %v", unsentDatum)
+		publishFailedChan <- unsentDatum
 
 		// trying to clean up
 		stream = nil
@@ -342,12 +322,22 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 			}
 
 			if err := send(datum, stream); err != nil {
-				// TODO: handle requeue
 				pubError(datum)
+			} else {
+				// succeeded sending this datum, so try to handle previous failures (if any)
+				select {
+				case failed := <-cachedAndRetryChan:
+					glog.V(3).Infof("Publishing previously failed record with ts: %v", failed.Ts)
+					if err := send(failed, stream); err != nil {
+						pubError(failed)
+					}
+				default:
+					// none found
+				}
 			}
 		}
 
 		// forevar !
-		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
