@@ -1,0 +1,6 @@
+FROM ##from_image##
+MAINTAINER mdye <mdye@us.ibm.com>
+
+ADD . /prj
+
+CMD ["/prj/synchrophasor-publisher", "-v", "3", "-logtostderr"]

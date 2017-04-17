@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"os"
 	"runtime/pprof"
 	"strconv"
@@ -15,6 +17,8 @@ import (
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/michaeldye/synchrophasor-proto/pmu_server"
 	"github.com/michaeldye/synchrophasor-proto/synchrophasor_dpe"
@@ -25,10 +29,8 @@ const (
 
 	defaultDPEServerAddress = "dpe:9009"
 
-	dpeReconnectionDelayS = 20
-
 	// number of separate publishing threads / maintained connections with destination service
-	numPublishers = 30
+	numPublishers = 1
 
 	// buffers are managed by publishers and (if failure occurs) written to disk
 	bufferLength = 50
@@ -105,6 +107,9 @@ type operationSample struct {
 func main() {
 	flag.Parse()
 
+	// disable gRPC logging by default
+	grpclog.SetLogger(log.New(ioutil.Discard, "", 0))
+
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
@@ -176,6 +181,8 @@ func read(client pmu_server.SynchrophasorDataClient, publishChan chan<- *pmu_ser
 		glog.Fatalf("Error establishing stream from PMU server: %v", err)
 	}
 
+	glog.Infof("Streaming data from /pmu_server.SynchrophasorData/Sample")
+
 	for {
 		datum, err := pmuStream.Recv()
 		if err == io.EOF {
@@ -193,7 +200,7 @@ func read(client pmu_server.SynchrophasorDataClient, publishChan chan<- *pmu_ser
 }
 
 func pmuConnect(pmuServerAddress string) (pmu_server.SynchrophasorDataClient, *grpc.ClientConn, error) {
-	conn, err := grpc.Dial(pmuServerAddress, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(20)*time.Second), grpc.WithBlock())
+	conn, err := grpc.Dial(pmuServerAddress, grpc.WithInsecure(), grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 20 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}), grpc.WithBackoffMaxDelay(time.Duration(5)*time.Second), grpc.WithTimeout(time.Duration(10)*time.Second), grpc.WithBlock())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,7 +211,7 @@ func pmuConnect(pmuServerAddress string) (pmu_server.SynchrophasorDataClient, *g
 
 func subscriber(pmuServerAddress string, publishChan chan<- *pmu_server.SynchrophasorDatum) {
 	for {
-		glog.Infof("Connecting to %v", pmuServerAddress)
+		glog.Infof("Attempting connection to %v", pmuServerAddress)
 		pmuClient, pmuConn, err := pmuConnect(pmuServerAddress)
 		if err != nil {
 			glog.Errorf("Error connecting to PMU server: %v", err)
@@ -219,9 +226,6 @@ func subscriber(pmuServerAddress string, publishChan chan<- *pmu_server.Synchrop
 			glog.Infof("Attempting to close PMU client connection before trying to reconnect to the server")
 			pmuConn.Close()
 		}
-
-		// delay reconnection
-		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -244,7 +248,7 @@ func dpeConnect(dpeServerAddress string) (synchrophasor_dpe.SynchrophasorDPEClie
 }
 
 func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_server.SynchrophasorDatum, cachedAndRetryChan <-chan *pmu_server.SynchrophasorDatum, publishFailedChan chan<- *pmu_server.SynchrophasorDatum, operationSampleChan chan<- *operationSample) {
-	glog.Infof("Started publisher %v", id)
+	glog.Infof("Started DPE publisher %v", id)
 
 	lat := os.Getenv("HZN_LAT")
 	lon := os.Getenv("HZN_LON")
@@ -263,10 +267,10 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 				Type:        "synchrophasor",
 				Lat:         float32(latF),
 				Lon:         float32(lonF),
-				DeviceID:    deviceID,
-				AgreementID: agreementID,
+				DeviceId:    deviceID,
+				AgreementId: agreementID,
 				Datum:       datum,
-				HAPartners:  haPartners,
+				HaPartners:  haPartners,
 			}); err != nil {
 				return fmt.Errorf("Error sending data to stream: %v", err)
 			}
