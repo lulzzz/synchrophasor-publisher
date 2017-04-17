@@ -4,12 +4,12 @@ A client of a local `pmu-emu` and a cloud-hosted `synchrophasor-dpe`. This servi
 
 Example invocation:
 
-    synchrophasor-dpe -logtostderr -v 5
+    HZN_HA_PARTNERS="frege,kripke" HZN_LAT="88.2" HZN_LON="-103.1" DEVICE_ID="heidegger" HZN_AGREEMENTID="34636asdf851751157asvz7xx89cv12571923516" PMU_SERVER_ADDRESS=localhost:8008 DPE_SERVER_ADDRESS=localhost:9009 ./synchrophasor-publisher -v 3 -logtostderr
 
 ## Related Projects
 
- * `synchrophasor-proto` (https://github.com/michaeldye/synchrophasor-proto): The protocol specifications for all synchrophasor data projects
  * `synchrophasor-publisher` (https://github.com/michaeldye/synchrophasor-publisher): A client that connects to the `pmu-emu`s gRPC server, processes data it gathers, and then publishes it to a gRPC ingest Data Processing Engine (DPE), an instances of `synchrophasor-dpe`
+ * `synchrophasor-proto` (https://github.com/michaeldye/synchrophasor-proto): The protocol specifications for all synchrophasor data projects
  * `pmu-emu` (https://github.com/michaeldye/pmu-emu): A Power Management Unit (PMU) Emulator
 
 ## Development
