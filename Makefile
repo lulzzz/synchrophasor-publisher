@@ -1,7 +1,6 @@
 SHELL := /bin/bash
 # N.B. this is for compat only, we want to use uname -m instead
 ARCH = $(shell tools/arch-tag)
-
 VERSION = $(shell cat VERSION)
 
 EXECUTABLE = $(shell basename $$PWD)
@@ -24,7 +23,7 @@ $(EXECUTABLE): $(shell find . -name '*.go' -not -path './vendor/*') proto
 
 clean:
 	find ./vendor -maxdepth 1 -not -path ./vendor -and -not -iname "vendor.json" -print0 | xargs -0 rm -Rf
-	cd $(GOPATH)/src/github.com/michaeldye/synchrophasor-proto && \
+	-cd ./vendor/github.com/michaeldye/synchrophasor-proto && \
 		make clean
 	rm -f $(EXECUTABLE)
 	rm -f Dockerfile-exec
@@ -53,8 +52,6 @@ docker-push: docker
 	docker push $(DOCKER_IMAGE):$(DOCKER_TAG)
 	docker push $(DOCKER_IMAGE):latest
 
-install: $(EXECUTABLE)
-
 lint:
 	-golint ./... | grep -v "vendor/"
 	-go vet ./... 2>&1 | grep -vP "exit\ status|vendor/"
@@ -71,7 +68,7 @@ publish: dirty clean test test-integration docker-push
 	git push -f --tags canonical master
 
 proto: deps
-	cd $(GOPATH)/src/github.com/michaeldye/synchrophasor-proto && \
+	cd ./vendor/github.com/michaeldye/synchrophasor-proto && \
 		make
 
-.PHONY: clean deps docker install lint publish test test-integration
+.PHONY: clean deps docker lint publish test test-integration
