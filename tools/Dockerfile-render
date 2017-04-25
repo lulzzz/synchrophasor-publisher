@@ -11,7 +11,7 @@ DEST="$P/$FNAME"
 
 cp "$2" "$DEST"
 
-if [ "$1" == "armv7l" ]; then
+if [ "$1" == "armhf" ]; then
   sed -i 's|##from_image##|armhf/alpine:3.5|' "$DEST"
 elif [ "$1" == "x86_64" ] || [ "$1" == "x86" ] ; then
   sed -i 's|##from_image##|alpine:3.5|' "$DEST"
