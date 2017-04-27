@@ -138,7 +138,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	workloadVersion := os.Getenv("WORKLOAD_VERSION")
+	workloadVersion = os.Getenv("WORKLOAD_VERSION")
 	if workloadVersion != "" {
 		glog.Infof("Set workload version from envvar to: %v", workloadVersion)
 	} else {
@@ -299,7 +299,7 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 	send := func(datum *pmu_server.SynchrophasorDatum, stream synchrophasor_dpe.SynchrophasorDPE_StoreClient) error {
 
 		if stream != nil {
-			if err := stream.Send(&synchrophasor_dpe.HorizonDatumWrapper{
+			wr := &synchrophasor_dpe.HorizonDatumWrapper{
 				Type:            "synchrophasor",
 				Lat:             float32(latF),
 				Lon:             float32(lonF),
@@ -308,7 +308,11 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 				WorkloadVersion: workloadVersion,
 				Datum:           datum,
 				HaPartners:      haPartners,
-			}); err != nil {
+			}
+
+			glog.V(6).Infof("Publishing: %v", wr)
+
+			if err := stream.Send(wr); err != nil {
 				return fmt.Errorf("Error sending data to stream: %v", err)
 			}
 		}
