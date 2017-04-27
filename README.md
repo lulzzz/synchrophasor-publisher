@@ -4,11 +4,11 @@ A client of a local `pmu-emu` and a cloud-hosted `synchrophasor-dpe`. This servi
 
 ### Example native invocation
 
-    HZN_HA_PARTNERS="frege,kripke" HZN_LAT="88.2" HZN_LON="-103.1" DEVICE_ID="heidegger" HZN_AGREEMENTID="34636asdf851751157asvz7xx89cv12571923516" PMU_SERVER_ADDRESS=localhost:8008 DPE_SERVER_ADDRESS=localhost:9009 ./synchrophasor-publisher -v 3 -logtostderr
+    HZN_HA_PARTNERS="frege,kripke" HZN_LAT="88.2" HZN_LON="-103.1" DEVICE_ID="heidegger" HZN_AGREEMENTID="34636asdf851751157asvz7xx89cv12571923516" PMU_SERVER_ADDRESS=localhost:8008 DPE_SERVER_ADDRESS=localhost:9009 WORKLOAD_VERSION=0.3 ./synchrophasor-publisher -v 3 -logtostderr
 
 ### Example Docker container invocation
 
-    docker run --rm --name synchrophasor-publisher-heidegger -e "HZN_HA_PARTNERS=frege,kripke" -e "HZN_LAT=88.2" -e "HZN_LON=-103.1" -e "DEVICE_ID=heidegger" -e "HZN_AGREEMENTID=34636asdf851751157asvz7xx89cv12571923516" -e "PMU_SERVER_ADDRESS=localhost:8008" -e "DPE_SERVER_ADDRESS=localhost:9009" -t summit.hovitos.engineering/$(./tools/arch-tag)/synchrophasor-publisher:latest
+    docker run --rm --name synchrophasor-publisher-heidegger -e "HZN_HA_PARTNERS=frege,kripke" -e "HZN_LAT=88.2" -e "HZN_LON=-103.1" -e "DEVICE_ID=heidegger" -e "HZN_AGREEMENTID=34636asdf851751157asvz7xx89cv12571923516" -e "PMU_SERVER_ADDRESS=localhost:8008" -e "DPE_SERVER_ADDRESS=localhost:9009" -e "WORKLOAD_VERSION:0.3" -t summit.hovitos.engineering/$(./tools/arch-tag)/synchrophasor-publisher:latest
 
 ## Related Projects
 

@@ -1,6 +1,9 @@
 FROM ##from_image##
 MAINTAINER mdye <mdye@us.ibm.com>
 
-ADD . /prj
+RUN mkdir -p /usr/local/synchrophasor
+ADD ./synchrophasor-publisher /usr/local/synchrophasor/
+ADD ./VERSION /usr/local/synchrophasor/
 
-CMD ["/prj/synchrophasor-publisher", "-v", "3", "-logtostderr"]
+WORKDIR /usr/local/synchrophasor
+CMD ["./synchrophasor-publisher", "-v", "3", "-logtostderr"]

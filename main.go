@@ -7,12 +7,12 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
-
-	"runtime"
 
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
@@ -28,6 +28,8 @@ const (
 	defaultPMUServerAddress = "pmu:8008"
 
 	defaultDPEServerAddress = "dpe:9009"
+
+	workloadVersionFileName = "VERSION"
 
 	// number of separate publishing threads / maintained connections with destination service
 	numPublishers = 1
@@ -50,6 +52,9 @@ const (
 )
 
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
+// written on first start or system bails
+var workloadVersion string
 
 type buffer struct {
 	writePtr int
@@ -104,6 +109,20 @@ type operationSample struct {
 	successfulSentBuffers int
 }
 
+func workloadVersionFromFile() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	fileContent, err := ioutil.ReadFile(filepath.Join(dir, workloadVersionFileName))
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(fileContent)), nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -117,6 +136,23 @@ func main() {
 		}
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
+	}
+
+	workloadVersion := os.Getenv("WORKLOAD_VERSION")
+	if workloadVersion != "" {
+		glog.Infof("Set workload version from envvar to: %v", workloadVersion)
+	} else {
+		wv, err := workloadVersionFromFile()
+		if err != nil {
+			glog.Errorf("Unable to read workload version from file. Error: %v", err)
+		}
+		workloadVersion = wv
+		glog.Infof("Set workload version from VERSION file to: %v", workloadVersion)
+	}
+
+	// bail if workloadVersion not yet set
+	if workloadVersion == "" {
+		panic("Unable to determine workload version. Either deploy this executable with a sibling VERSION file or override with the WORKLOAD_VERSION environment variable")
 	}
 
 	pmuServerAddress := os.Getenv("PMU_SERVER_ADDRESS")
@@ -264,13 +300,14 @@ func connectAndPublish(id int, dpeServerAddress string, publishChan <-chan *pmu_
 
 		if stream != nil {
 			if err := stream.Send(&synchrophasor_dpe.HorizonDatumWrapper{
-				Type:        "synchrophasor",
-				Lat:         float32(latF),
-				Lon:         float32(lonF),
-				DeviceId:    deviceID,
-				AgreementId: agreementID,
-				Datum:       datum,
-				HaPartners:  haPartners,
+				Type:            "synchrophasor",
+				Lat:             float32(latF),
+				Lon:             float32(lonF),
+				DeviceId:        deviceID,
+				AgreementId:     agreementID,
+				WorkloadVersion: workloadVersion,
+				Datum:           datum,
+				HaPartners:      haPartners,
 			}); err != nil {
 				return fmt.Errorf("Error sending data to stream: %v", err)
 			}
